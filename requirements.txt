@@ -1,0 +1,6 @@
+yt-dlp
+requests
+pyperclip
+Pillow
+imageio-ffmpeg
+PyQt6
