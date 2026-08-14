@@ -4,7 +4,9 @@
 # للبناء يدويًا (على ويندوز):
 #     pyinstaller MGV4_3.spec
 #
-# الناتج يظهر في مجلد dist/ باسم "MG Downloader v4.3.exe"
+# الناتج (onedir): مجلد dist/MG Downloader v4.3/ يحوي الملف التنفيذي
+# "MG Downloader v4.3.exe" بجانب كل ملفاته المساندة (أسرع في الفتح من
+# onefile لأنه لا يفكّ نفسه في مجلد مؤقت عند كل تشغيل).
 
 import os
 
@@ -41,17 +43,13 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="MG Downloader v4.3",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -59,4 +57,15 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=ICON_PATH,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="MG Downloader v4.3",
 )
