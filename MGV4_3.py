@@ -346,6 +346,19 @@ def _is_force_platform(url: str) -> bool:
     return _is_facebook_url(url) or _is_soundcloud_url(url)
 
 
+def _facebook_video_output_path(directory: str, base_name: str, extension: str = ".mp4") -> str:
+    """إنشاء مسار Facebook فريد باسم الفيديو وتاريخ/وقت التحميل."""
+    extension = extension if extension.startswith(".") else f".{extension}"
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    stem = f"{base_name}_{stamp}"
+    candidate = os.path.join(directory, f"{stem}{extension}")
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{stem}_{counter}{extension}")
+        counter += 1
+    return candidate
+
+
 # ------------------ فحص يدوي لصفحة ويب "غريبة" عن روابط ميديا مباشرة ------------------ #
 # تُستخدم في شاشة "تحميل الجميع" عندما يفشل yt-dlp في فهم الرابط (رابط غريب/غير مدعوم):
 # نجلب صفحة الويب ونبحث نصياً عن أي روابط فيديو أو صوت مباشرة ونضعها في المكان المناسب.
@@ -521,6 +534,8 @@ _DEFAULTS = {
     },
     "queue": {
         "capture_enabled": True,
+        "width": 660,
+        "height": 540,
     },
     "settings": {
         "cookies_browser": "تلقائي",
@@ -2902,6 +2917,19 @@ class QueueManager(QObject):
         self._threads.append((thread, worker))
         thread.start()
 
+    def reanalyze(self, item_id: int):
+        """إعادة تحليل عنصر موجود دون نسخ الرابط من المصدر مرة أخرى."""
+        item = self._items.get(item_id)
+        if item is None or item.status in ("analyzing", "queued"):
+            return
+        item.status = "analyzing"
+        item.error_msg = ""
+        item.audio = {}
+        item.video = {}
+        item.video_audio = {}
+        self.item_updated.emit(item)
+        self._enqueue_or_start(item)
+
     def _cleanup_thread(self, thread):
         self._threads = [(t, w) for (t, w) in self._threads if t is not thread]
         self._start_next_pending()
@@ -3319,6 +3347,8 @@ class DownloadCard(QFrame):
 class QueueCard(QFrame):
     """بطاقة عنصر واحد داخل قائمة الانتظار — بنفس تصميم بطاقة التحميل."""
 
+    reanalyze_requested = pyqtSignal(int)
+
     def __init__(self, item: QueueItem, manager: "QueueManager", parent=None):
         super().__init__(parent)
         self.item = item
@@ -3371,6 +3401,11 @@ class QueueCard(QFrame):
         self.delete_btn.setToolTip("حذف من القائمة")
         self.delete_btn.clicked.connect(self._on_delete_clicked)
 
+        self.reanalyze_btn = QPushButton("🔄")
+        self.reanalyze_btn.setFixedSize(34, 28)
+        self.reanalyze_btn.setToolTip("إعادة تحليل الرابط")
+        self.reanalyze_btn.clicked.connect(self._on_reanalyze_clicked)
+
         self.thumb_label = QLabel("صورة")
         self.thumb_label.setFixedSize(104, 58)
         self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3382,9 +3417,6 @@ class QueueCard(QFrame):
 
         top_row.addWidget(self.name_label, 1)
         top_row.addWidget(self.status_label)
-        top_row.addWidget(self.copy_btn)
-        top_row.addWidget(self.open_btn)
-        top_row.addWidget(self.delete_btn)
         top_row.addWidget(self.thumb_label)
         outer.addLayout(top_row)
 
@@ -3397,8 +3429,14 @@ class QueueCard(QFrame):
         self.quality_combo.setEnabled(False)
         bottom_row.addWidget(self.quality_combo, 1)
 
-        self.download_btn = QPushButton("⬇️")
-        self.download_btn.setFixedSize(34, 28)
+        # أزرار الإجراءات الرمزية بجانب زر التحميل في الصف السفلي.
+        bottom_row.addWidget(self.copy_btn)
+        bottom_row.addWidget(self.open_btn)
+        bottom_row.addWidget(self.delete_btn)
+        bottom_row.addWidget(self.reanalyze_btn)
+
+        self.download_btn = QPushButton("تحميل")
+        self.download_btn.setMinimumSize(96, 34)
         self.download_btn.setToolTip("تحميل بالجودة المختارة")
         self.download_btn.setEnabled(False)
         self.download_btn.clicked.connect(self._on_download_clicked)
@@ -3488,6 +3526,7 @@ class QueueCard(QFrame):
         self._raw_name = item.display_title
         self.name_label.setToolTip(item.url)
         self._apply_elide()
+        self.reanalyze_btn.setEnabled(item.status not in ("analyzing", "queued"))
         pix = self.thumb_label.pixmap()
         if pix is None or pix.isNull():
             self._start_thumbnail_load()
@@ -3500,6 +3539,7 @@ class QueueCard(QFrame):
         elif item.status == "analyzing":
             self.status_label.setText("جاري التحليل...")
             self.status_label.setToolTip("")
+            self.quality_combo.clear()
             self.quality_combo.setEnabled(False)
             self.download_btn.setEnabled(False)
         elif item.status == "error":
@@ -3573,6 +3613,9 @@ class QueueCard(QFrame):
             self.quality_combo.addItem(f"🎧 {label}", (fid, sz, "audio"))
 
     # ---------------------- الأزرار ---------------------- #
+    def _on_reanalyze_clicked(self):
+        self.reanalyze_requested.emit(self.item.item_id)
+
     def _on_copy_clicked(self):
         try:
             pyperclip.copy(self.item.url)
@@ -3589,28 +3632,38 @@ class QueueCard(QFrame):
     def _on_delete_clicked(self):
         self.manager.remove_item(self.item.item_id)
 
-    def _on_download_clicked(self):
+    def _build_selected_task(self):
         idx = self.quality_combo.currentIndex()
         if idx < 0:
-            return
-        fid, size, kind = self.quality_combo.itemData(idx)
+            return None
+        data = self.quality_combo.itemData(idx)
+        if not data or len(data) < 3:
+            return None
+        fid, _size, kind = data
         try:
-            data = load_paths()
+            paths = load_paths()
         except Exception:
-            data = {}
-        path_audio = data.get("path_audio", default_downloads_dir())
-        path_video = data.get("path_video", default_downloads_dir())
+            paths = {}
+        path_audio = paths.get("path_audio", default_downloads_dir())
+        path_video = paths.get("path_video", default_downloads_dir())
 
         backend = YouTubeDownloader()
         name = backend.clean_filename(self.item.title or "untitled")
         if kind == "audio":
-            out = os.path.join(path_audio, f"{name}.mp3")
+            if _is_facebook_url(self.item.url):
+                out = _facebook_video_output_path(path_audio, name, ".mp3")
+            else:
+                out = os.path.join(path_audio, f"{name}.mp3")
+        elif _is_facebook_url(self.item.url):
+            # فيديو Facebook يُحفظ دائماً mp4 وباسم مؤرخ لتفادي تكرار أسماء
+            # فيديوهات متعددة مأخوذة من الصفحة نفسها.
+            out = _facebook_video_output_path(path_video, name, ".mp4")
         else:
             # مسار فيديو الشاشة الرئيسية يُترك بلا امتداد؛ yt-dlp يحدد الامتداد
             # النهائي بعد الدمج وفق merge_output_format.
             out = os.path.join(path_video, name)
 
-        task = DownloadTask(
+        return DownloadTask(
             url=self.item.url,
             format_id=str(fid),
             output_path=out,
@@ -3618,6 +3671,11 @@ class QueueCard(QFrame):
             display_name=os.path.basename(out) or name,
             thumbnail_url=self.item.thumbnail_url,
         )
+
+    def _on_download_clicked(self):
+        task = self._build_selected_task()
+        if task is None:
+            return
         DownloadManager.instance().add_task(task)
         # بعد إرسالها لمدير التحميلات، لم تعد بحاجة للبقاء في قائمة الانتظار
         self.manager.remove_item(self.item.item_id)
@@ -3633,7 +3691,13 @@ class QueueDialog(QDialog):
         self.cards: Dict[int, QueueCard] = {}
 
         self.setWindowTitle("🕒 قائمة الانتظار")
-        self.resize(660, 540)
+        queue_settings = get_section("queue")
+        try:
+            saved_width = max(500, int(queue_settings.get("width", 660)))
+            saved_height = max(400, int(queue_settings.get("height", 540)))
+        except (TypeError, ValueError):
+            saved_width, saved_height = 660, 540
+        self.resize(saved_width, saved_height)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -3677,8 +3741,14 @@ class QueueDialog(QDialog):
         self.clear_all_btn.clicked.connect(self._on_clear_all_clicked)
         btns_row.addWidget(self.clear_all_btn)
 
+        self.download_all_btn = QPushButton("تحميل")
+        self.download_all_btn.setMinimumSize(130, 40)
+        self.download_all_btn.setToolTip("تحميل كل العناصر الجاهزة بالجودة المحددة في كل بطاقة")
+        self.download_all_btn.clicked.connect(self._on_download_all_clicked)
+        btns_row.addWidget(self.download_all_btn)
+
         close_btn = QPushButton("إغلاق")
-        close_btn.clicked.connect(self.hide)
+        close_btn.clicked.connect(self._hide_and_save)
         btns_row.addWidget(close_btn)
 
         root.addLayout(btns_row)
@@ -3690,19 +3760,23 @@ class QueueDialog(QDialog):
         self.manager.item_added.connect(self._add_card)
         self.manager.item_updated.connect(self._update_card)
         self.manager.item_removed.connect(self._remove_card)
+        self._update_download_all_btn()
 
     def _add_card(self, item: QueueItem):
         if item.item_id in self.cards:
             return
         card = QueueCard(item, self.manager)
+        card.reanalyze_requested.connect(self.manager.reanalyze)
         self.cards[item.item_id] = card
         self.cards_layout.insertWidget(0, card)
         self._update_empty()
+        self._update_download_all_btn()
 
     def _update_card(self, item: QueueItem):
         card = self.cards.get(item.item_id)
         if card is not None:
             card.refresh(item)
+        self._update_download_all_btn()
 
     def _remove_card(self, item_id: int):
         card = self.cards.pop(item_id, None)
@@ -3714,9 +3788,35 @@ class QueueDialog(QDialog):
             card.setParent(None)
             card.deleteLater()
         self._update_empty()
+        self._update_download_all_btn()
 
     def _update_empty(self):
         self.empty_label.setVisible(len(self.cards) == 0)
+
+    def _update_download_all_btn(self):
+        ready = any(
+            card.item.status == "ready" and card.quality_combo.count() > 0
+            for card in self.cards.values()
+        )
+        self.download_all_btn.setEnabled(ready)
+
+    def _on_download_all_clicked(self):
+        tasks = []
+        item_ids = []
+        for card in list(self.cards.values()):
+            if card.item.status != "ready":
+                continue
+            task = card._build_selected_task()
+            if task is not None:
+                tasks.append(task)
+                item_ids.append(card.item.item_id)
+        if not tasks:
+            return
+        manager = DownloadManager.instance()
+        for task in tasks:
+            manager.add_task(task)
+        for item_id in item_ids:
+            self.manager.remove_item(item_id)
 
     def _on_clear_all_clicked(self):
         if not self.cards:
@@ -3732,12 +3832,19 @@ class QueueDialog(QDialog):
         if answer == QMessageBox.StandardButton.Yes:
             self.manager.clear_all()
 
+    def _save_size(self):
+        try:
+            update_section("queue", {"width": int(self.width()), "height": int(self.height())})
+        except Exception:
+            pass
+
+    def _hide_and_save(self):
+        self._save_size()
+        self.hide()
+
     def closeEvent(self, event):
-        """نافذة قائمة الانتظار تبقى حيّة طوال عمل البرنامج (مُنشأة مرة واحدة
-        فقط) — الضغط على زر الإغلاق أو X يُخفيها فقط بدل تدميرها. تدميرها
-        وإعادة إنشائها في كل مرة كان يعرّض ثريدات تحميل الصور المصغّرة
-        (التي قد تكون لا تزال تعمل) للتدمير المفاجئ، وهو ما كان يسبب
-        إغلاق البرنامج بأكمله فجأة عند الضغط على الزر."""
+        """إخفاء النافذة مع حفظ أبعادها بدلاً من تدميرها."""
+        self._save_size()
         event.ignore()
         self.hide()
 
@@ -6169,6 +6276,10 @@ class ForceTab(QWidget):
         # تحديد المسار النهائي
         if self.selected_audio_idx is not None and self.selected_video_idx is None and self.selected_av_idx is None:
             out = os.path.join(path_audio, f"{name}.mp3")
+        elif _is_facebook_url(self.url):
+            # فيديوهات Facebook دائماً mp4 وباسم مؤرخ لتفادي تعارض أسماء
+            # عدة فيديوهات مصدرها الصفحة نفسها.
+            out = _facebook_video_output_path(path_video, name, ".mp4")
         elif self.selected_av_idx is not None:
             out = os.path.join(path_video, f"{name}.mp4")
         else:
@@ -6761,7 +6872,10 @@ class ListTab(QWidget):
                 if not ids[v] or not ids[audio_idx]:
                     continue
                 fmt = f"{ids[audio_idx]}+{ids[v]}"
-                out = os.path.join(folder, name)
+                if _is_facebook_url(url_item):
+                    out = _facebook_video_output_path(folder, name, ".mp4")
+                else:
+                    out = os.path.join(folder, name)
 
             task = DownloadTask(
                 url=url_item,
@@ -6931,6 +7045,8 @@ class MainWindow(QMainWindow):
             for page in self.pages.values():
                 qdlg = getattr(page, "_queue_dialog", None)
                 if qdlg is not None:
+                    if hasattr(qdlg, "_save_size"):
+                        qdlg._save_size()
                     qdlg.shutdown_threads()
         except Exception as e:
             print(f"queue shutdown error: {e}")
