@@ -82,7 +82,7 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, List
 from http.cookiejar import MozillaCookieJar
-from urllib.parse import urljoin
+from urllib.parse import urljoin, parse_qs, urlparse
 
 
 # ------------------ مجلد بيانات التطبيق المحلي ------------------ #
@@ -157,7 +157,7 @@ def _atomic_write_text(path: str, text: str, encoding: str = "utf-8"):
 
 
 for _legacy_name in ("settings.json", "yt_cookies.txt", "path.json", "path_merge.json",
-                      "download_history.json"):
+                      "download_history.json", "queue_items.json"):
     _migrate_legacy_file(_legacy_name)
 
 # ------------------ سجل الأخطاء (يجب أن يحدث قبل الاستيرادات الكبيرة) ------ #
@@ -264,7 +264,7 @@ from PyQt6.QtWidgets import (
 )
 
 APP_VERSION = "4.3"
-APP_VERSION_FULL = "4.3.0"
+APP_VERSION_FULL = "4.3.0.0"
 APP_TITLE = "MG Downloader v4.3"
 
 FFMPEG = get_ffmpeg_exe()
@@ -344,6 +344,22 @@ def _is_soundcloud_url(url: str) -> bool:
 
 def _is_force_platform(url: str) -> bool:
     return _is_facebook_url(url) or _is_soundcloud_url(url)
+
+
+def _looks_like_playlist_url(url: str) -> bool:
+    """التعرّف على روابط القوائم قبل عرض نتيجة التحليل كفشل عادي."""
+    raw = (url or "").strip().lower()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw)
+        query = parse_qs(parsed.query)
+        if any(key in query for key in ("list", "playlist", "collection", "album")):
+            return True
+        path = parsed.path or ""
+    except Exception:
+        path = raw
+    return any(marker in path for marker in ("/playlist", "/playlists", "/collection/", "/album/"))
 
 
 def _facebook_video_output_path(directory: str, base_name: str, extension: str = ".mp4") -> str:
@@ -507,6 +523,7 @@ def _scan_page_for_media(url: str):
 
 
 SETTINGS_FILE = _app_data_path("settings.json")
+QUEUE_FILE = _app_data_path("queue_items.json")
 
 _DEFAULTS = {
     "main": {
@@ -2837,6 +2854,7 @@ class QueueManager(QObject):
         self._threads = []            # (thread, worker) قيد التحليل حالياً (بحد أقصى MAX_PARALLEL_ANALYSIS)
         self._pending_ids: List[int] = []  # item_id بانتظار توفر مكان للتحليل
         self._capture_enabled = bool(get_section("queue").get("capture_enabled", True))
+        self._load_items()
         # مراقبة الحافظة كل 1.2 ثانية — كافية للاستجابة السريعة بلا استهلاك ملحوظ.
         self._timer = QTimer(self)
         self._timer.setInterval(1200)
@@ -2848,6 +2866,92 @@ class QueueManager(QObject):
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    # ------------------------- حفظ واستعادة قائمة الانتظار ------------------------- #
+    @staticmethod
+    def _indexed_dict(value) -> dict:
+        """إعادة مفاتيح dict المفهرسة إلى أعداد صحيحة بعد قراءتها من JSON."""
+        if not isinstance(value, dict):
+            return {}
+        restored = {}
+        for key, entry in value.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(entry, (list, tuple)):
+                restored[index] = list(entry)
+        return restored
+
+    @staticmethod
+    def _item_to_dict(item: QueueItem) -> dict:
+        return {
+            "item_id": item.item_id,
+            "url": item.url,
+            "status": item.status,
+            "title": item.title,
+            "thumbnail_url": item.thumbnail_url,
+            "duration": item.duration,
+            "error_msg": item.error_msg,
+            "audio": item.audio or {},
+            "video": item.video or {},
+            "video_audio": item.video_audio or {},
+        }
+
+    def _save_items(self):
+        """حفظ القائمة الحالية ذرّياً حتى تبقى العناصر بين جلسات البرنامج."""
+        try:
+            payload = [self._item_to_dict(item) for item in self._items.values()]
+            _atomic_write_text(QUEUE_FILE, json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception as e:
+            print(f"[queue] خطأ حفظ القائمة: {e}")
+
+    def _load_items(self):
+        """استعادة العناصر المحفوظة؛ التحليل غير المكتمل يُستأنف في الخلفية."""
+        try:
+            if not os.path.exists(QUEUE_FILE):
+                return
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                payload = payload.get("items", [])
+            if not isinstance(payload, list):
+                return
+
+            restored_items = []
+            for data in payload:
+                if not isinstance(data, dict):
+                    continue
+                url = (data.get("url") or "").strip()
+                if not _is_valid_url(url) or url in self._active_urls:
+                    continue
+                item = QueueItem(url=url)
+                item.status = data.get("status") if data.get("status") in (
+                    "ready", "error", "playlist", "analyzing", "queued"
+                ) else "error"
+                if item.status == "error" and _looks_like_playlist_url(url):
+                    item.status = "playlist"
+                item.title = data.get("title") or ""
+                item.thumbnail_url = data.get("thumbnail_url") or ""
+                try:
+                    item.duration = int(data.get("duration") or 0)
+                except (TypeError, ValueError):
+                    item.duration = 0
+                item.error_msg = data.get("error_msg") or ""
+                item.audio = self._indexed_dict(data.get("audio"))
+                item.video = self._indexed_dict(data.get("video"))
+                item.video_audio = self._indexed_dict(data.get("video_audio"))
+                self._items[item.item_id] = item
+                self._active_urls.add(url)
+                restored_items.append(item)
+
+            # لا يمكن ترك ثريدات جلسة سابقة في حالة analyzing/queued؛ نعيد
+            # إدخالها في مسار التحليل المعتاد عند بدء البرنامج.
+            for item in restored_items:
+                if item.status in ("analyzing", "queued"):
+                    self._enqueue_or_start(item)
+        except Exception as e:
+            print(f"[queue] خطأ استعادة القائمة: {e}")
 
     # ------------------------- إعداد التقاط الحافظة ------------------------- #
     def set_capture_enabled(self, enabled: bool):
@@ -2929,6 +3033,7 @@ class QueueManager(QObject):
         item.video_audio = {}
         self.item_updated.emit(item)
         self._enqueue_or_start(item)
+        self._save_items()
 
     def _cleanup_thread(self, thread):
         self._threads = [(t, w) for (t, w) in self._threads if t is not thread]
@@ -2950,8 +3055,12 @@ class QueueManager(QObject):
             return
         audio, video, video_audio, info_url = result
         if not audio and not video and not video_audio:
-            item.status = "error"
-            item.error_msg = "تعذّر العثور على أي تنسيقات قابلة للتحميل لهذا الرابط."
+            item.status = "playlist" if _looks_like_playlist_url(item.url) else "error"
+            item.error_msg = (
+                "هذا الرابط يشير إلى قائمة فيديوهات. أضف رابط فيديو منفرداً للتحميل."
+                if item.status == "playlist"
+                else "تعذّر العثور على أي تنسيقات قابلة للتحميل لهذا الرابط."
+            )
         else:
             item.status = "ready"
             item.audio, item.video, item.video_audio = audio, video, video_audio
@@ -2959,14 +3068,19 @@ class QueueManager(QObject):
             item.title = info_url[0] or item.url
             item.duration = info_url[1] or 0
             item.thumbnail_url = info_url[2] or ""
+        self._save_items()
         self.item_updated.emit(item)
 
     def _on_analyze_error(self, item_id: int, msg: str):
         item = self._items.get(item_id)
         if item is None:
             return
-        item.status = "error"
-        item.error_msg = msg
+        item.status = "playlist" if _looks_like_playlist_url(item.url) else "error"
+        item.error_msg = (
+            "هذا الرابط يشير إلى قائمة فيديوهات. أضف رابط فيديو منفرداً للتحميل."
+            if item.status == "playlist" else msg
+        )
+        self._save_items()
         self.item_updated.emit(item)
 
     def remove_item(self, item_id: int):
@@ -2975,6 +3089,7 @@ class QueueManager(QObject):
             self._active_urls.discard(item.url)
         if item_id in self._pending_ids:
             self._pending_ids.remove(item_id)
+        self._save_items()
         self.item_removed.emit(item_id)
 
     def clear_all(self):
@@ -2998,6 +3113,7 @@ class QueueManager(QObject):
             self._timer.stop()
         except Exception:
             pass
+        self._save_items()
         for (t, w) in list(self._threads):
             try:
                 t.quit()
@@ -3540,6 +3656,11 @@ class QueueCard(QFrame):
             self.status_label.setText("جاري التحليل...")
             self.status_label.setToolTip("")
             self.quality_combo.clear()
+            self.quality_combo.setEnabled(False)
+            self.download_btn.setEnabled(False)
+        elif item.status == "playlist":
+            self.status_label.setText("قائمة")
+            self.status_label.setToolTip(item.error_msg or "هذا الرابط قائمة فيديوهات وليس ملف فيديو منفرداً.")
             self.quality_combo.setEnabled(False)
             self.download_btn.setEnabled(False)
         elif item.status == "error":
