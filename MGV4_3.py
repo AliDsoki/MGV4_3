@@ -3464,6 +3464,7 @@ class QueueCard(QFrame):
     """بطاقة عنصر واحد داخل قائمة الانتظار — بنفس تصميم بطاقة التحميل."""
 
     reanalyze_requested = pyqtSignal(int)
+    playlist_requested = pyqtSignal(str)
 
     def __init__(self, item: QueueItem, manager: "QueueManager", parent=None):
         super().__init__(parent)
@@ -3499,8 +3500,12 @@ class QueueCard(QFrame):
             _initial_status = "⏳ في الانتظار..."
         else:
             _initial_status = ""
-        self.status_label = QLabel(_initial_status)
+        self.status_label = QPushButton(_initial_status)
         self.status_label.setObjectName("StatusChip")
+        self.status_label.setFlat(True)
+        self.status_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.status_label.setEnabled(item.status == "playlist")
+        self.status_label.clicked.connect(self._on_status_clicked)
 
         self.copy_btn = QPushButton("📋")
         self.copy_btn.setFixedSize(34, 28)
@@ -3643,6 +3648,7 @@ class QueueCard(QFrame):
         self.name_label.setToolTip(item.url)
         self._apply_elide()
         self.reanalyze_btn.setEnabled(item.status not in ("analyzing", "queued"))
+        self.status_label.setEnabled(item.status == "playlist")
         pix = self.thumb_label.pixmap()
         if pix is None or pix.isNull():
             self._start_thumbnail_load()
@@ -3734,6 +3740,10 @@ class QueueCard(QFrame):
             self.quality_combo.addItem(f"🎧 {label}", (fid, sz, "audio"))
 
     # ---------------------- الأزرار ---------------------- #
+    def _on_status_clicked(self):
+        if self.item.status == "playlist":
+            self.playlist_requested.emit(self.item.url)
+
     def _on_reanalyze_clicked(self):
         self.reanalyze_requested.emit(self.item.item_id)
 
@@ -3805,6 +3815,8 @@ class QueueCard(QFrame):
 # ----------------------------- QueueDialog ----------------------------------- #
 class QueueDialog(QDialog):
     """نافذة قائمة الانتظار — تعرض كل الروابط المنسوخة التي يتم تحليلها في الخلفية."""
+
+    playlist_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3888,6 +3900,7 @@ class QueueDialog(QDialog):
             return
         card = QueueCard(item, self.manager)
         card.reanalyze_requested.connect(self.manager.reanalyze)
+        card.playlist_requested.connect(self.playlist_requested.emit)
         self.cards[item.item_id] = card
         self.cards_layout.insertWidget(0, card)
         self._update_empty()
@@ -4305,10 +4318,10 @@ HELP_HTML = """
   th { background-color: #3A3A40; color: #B0D4F1; }
 </style>
 
-<h1>📖 دليل استخدام MG v4</h1>
+<h1>📖 دليل استخدام MG v4.3</h1>
 
 <p>
-برنامج <b>MG v4</b> أداة شاملة لتحميل الفيديوهات والصوتيات من يوتيوب وفيسبوك
+برنامج <b>MG v4.3</b> أداة شاملة لتحميل الفيديوهات والصوتيات من يوتيوب وفيسبوك
 وساوندكلاود وأكثر من 1000 منصة، مع نظام تحميل متعدد متوازي، سجل تحميلات،
 وميزات متقدمة للترجمة والدمج والترميز.
 </p>
@@ -4472,7 +4485,7 @@ HELP_HTML = """
 
 <hr>
 <p style="text-align: center; color: #888; margin-top: 20px;">
-<b>MG v4</b> — برمجة <b>علي دسوقي محمد</b> — 2026<br>
+<b>MG v4.3</b> — برمجة <b>علي دسوقي محمد</b> — 2026<br>
 هاتف: 01060234822 — والحمد لله رب العالمين 🌹
 </p>
 """
@@ -4483,7 +4496,7 @@ class HelpDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("📖 دليل استخدام MG v4")
+        self.setWindowTitle("📖 دليل استخدام MG v4.3")
         self.resize(900, 650)
         self.setMinimumSize(700, 500)
 
@@ -4549,7 +4562,7 @@ class SettingsTab(QWidget):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
-        header = QLabel("⚙️ الإعدادات العامة - MG v4")
+        header = QLabel("⚙️ الإعدادات العامة - MG v4.3")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header.setStyleSheet("color: silver; font-size: 24px; font-weight: bold; padding: 8px;")
         root.addWidget(header)
@@ -5456,6 +5469,7 @@ class AnalyzeWorker(QObject):
 # ----------------------------- MainTab ------------------------------------- #
 class MainTab(QWidget):
     request_force_analyze = pyqtSignal(str)
+    request_open_playlist = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -5699,6 +5713,7 @@ class MainTab(QWidget):
         # مفاجئ يُغلق البرنامج بأكمله.
         if getattr(self, "_queue_dialog", None) is None:
             self._queue_dialog = QueueDialog(self)
+            self._queue_dialog.playlist_requested.connect(self.request_open_playlist.emit)
         self._queue_dialog.show()
         self._queue_dialog.raise_()
         self._queue_dialog.activateWindow()
@@ -6703,11 +6718,18 @@ class ListTab(QWidget):
         self.path_label.setText(f" {self.path_list} ")
 
     # ------------------------------- pick playlist ------------------------ #
-    def _pick_link(self):
-        try:
-            url = pyperclip.paste().split("&")[0].strip()
-        except Exception:
-            url = ""
+    def set_url_and_pick(self, url: str):
+        """فتح مسار إدخال القائمة باستخدام رابط قادم من قائمة الانتظار."""
+        self._pick_link(url)
+
+    def _pick_link(self, url: str = None):
+        if not isinstance(url, str) or not url.strip():
+            try:
+                url = pyperclip.paste().split("&")[0].strip()
+            except Exception:
+                url = ""
+        else:
+            url = url.split("&")[0].strip()
         if not (url.startswith("http://") or url.startswith("https://")):
             QMessageBox.warning(self, "رابط غير صالح", "انسخ رابطاً صالحاً ثم اضغط نسخ الرابط.")
             return
@@ -7124,6 +7146,8 @@ class MainWindow(QMainWindow):
         main_page = self.pages.get("main")
         if main_page is not None and hasattr(main_page, "request_force_analyze"):
             main_page.request_force_analyze.connect(self._open_force_and_analyze)
+        if main_page is not None and hasattr(main_page, "request_open_playlist"):
+            main_page.request_open_playlist.connect(self._open_list_and_pick)
 
     def _switch_to(self, key):
         page = self.pages.get(key)
@@ -7151,6 +7175,13 @@ class MainWindow(QMainWindow):
         force_page = self.pages.get("force")
         if force_page is not None and hasattr(force_page, "start_fetch_for_url"):
             QTimer.singleShot(80, lambda u=url: force_page.start_fetch_for_url(u))
+
+    def _open_list_and_pick(self, url: str):
+        """فتح تبويب تحميل القوائم وتمرير الرابط إلى مسار «نسخ الرابط» نفسه."""
+        self._switch_to("list")
+        list_page = self.pages.get("list")
+        if list_page is not None and hasattr(list_page, "set_url_and_pick"):
+            QTimer.singleShot(80, lambda u=url: list_page.set_url_and_pick(u))
 
     def closeEvent(self, event):
         # إغلاق آمن: إيقاف كل التحميلات والـ threads قدر الإمكان.
